@@ -8,282 +8,293 @@ import itertools
 
 app = FastAPI()
 
-# --- 1. 核心量化與特性分析邏輯 ---
+# --- 1. 核心量化分析邏輯 (V6.7) ---
 
-def get_data_and_analyze():
-    """執行全策略分析並加入組合特性分類"""
+def get_data_and_analyze(target_date=None):
     now = datetime.datetime.now()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://winwin.tw/Bingo',
-        'X-Requested-With': 'XMLHttpRequest'
-    }
+    if not target_date: target_date = now.strftime("%Y-%m-%d")
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://winwin.tw/Bingo'}
 
     def fetch_api(date_str):
-        target_url = f"https://winwin.tw/Bingo/GetBingoData?date={date_str}"
+        url = f"https://winwin.tw/Bingo/GetBingoData?date={date_str}"
         try:
-            resp = requests.get(target_url, headers=headers, timeout=10)
+            resp = requests.get(url, headers=headers, timeout=10)
             return resp.json() if resp.status_code == 200 else None
         except: return None
 
-    # 自動日期回溯邏輯
-    api_data = fetch_api(now.strftime("%Y-%m-%d"))
-    if not api_data:
+    api_data = fetch_api(target_date)
+    if not api_data and target_date == now.strftime("%Y-%m-%d"):
         api_data = fetch_api((now - datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
 
-    if not api_data: return None, "無資料", "穩定"
+    if not api_data:
+        return [], "0:0", "0:0", "0:0", "0:0", {}, [], "N/A", target_date
 
-    period_range = f"{api_data[0].get('No', 'N/A')} ~ {api_data[min(29, len(api_data)-1)].get('No', 'N/A')}"
-    
     all_draws = []
     for item in api_data:
         draw_str = item.get('BigShowOrder', '')
         if draw_str:
             nums = [int(n) for n in draw_str.split(',') if n.strip().isdigit()]
             if len(nums) == 20: all_draws.append(nums)
-    if not all_draws: return None, period_range, "等待數據"
-
-    # --- 策略 A: 奇偶回歸與權重 ---
+    
+    latest_no = api_data[0].get('No', 'N/A')
+    latest_win_nums = all_draws[0] if all_draws else []
+    
+    # 環境統計
+    all_balls = [n for d in all_draws for n in d]
+    o_day = len([n for n in all_balls if n % 2 != 0]); e_day = len(all_balls) - o_day
+    s_day = len([n for n in all_balls if n <= 40]); b_day = len(all_balls) - s_day
+    
     recent_20 = all_draws[:20]
-    total_nums_20 = [n for d in recent_20 for n in d]
-    o_count = len([n for n in total_nums_20 if n % 2 != 0])
-    e_count = 400 - o_count
-    
-    odd_weight = 1.2 if e_count > o_count else 1.0
-    even_weight = 1.2 if o_count > e_count else 1.0
-    parity_status = f"奇{o_count} : 偶{e_count}"
+    o_20 = len([n for d in recent_20 for n in d if n % 2 != 0]); e_20 = 400 - o_20
+    s_20 = len([n for d in recent_20 for n in d if n <= 40]); b_20 = 400 - s_20
 
-    # --- 策略 B: 拖牌矩陣計算 ---
-    co_occurrence = Counter()
-    for draw in all_draws[:50]:
-        for pair in itertools.combinations(sorted(draw), 2):
-            co_occurrence[pair] += 1
-    
-    last_draw = all_draws[0]
-    drag_scores = Counter()
-    for num in range(1, 81):
-        for last_num in last_draw:
-            pair = tuple(sorted((num, last_num)))
-            drag_scores[num] += co_occurrence.get(pair, 0)
+    # 閥值判定
+    THRESHOLD = 160 
+    status = {
+        'odd': o_20 <= THRESHOLD, 'even': e_20 <= THRESHOLD,
+        'small': s_20 <= THRESHOLD, 'big': b_20 <= THRESHOLD
+    }
 
-    # --- 策略 C: 綜合評分與反向熱度 ---
-    short_term_heat = Counter([n for d in all_draws[:15] for n in d])
-    long_term_freq = Counter([n for d in all_draws[:50] for n in d])
-    repeat_pool = set(all_draws[0])
+    # 權重分配
+    wp_odd = 1.2 if status['odd'] else 1.0
+    wp_even = 1.2 if status['even'] else 1.0
+    ws_small = 1.2 if status['small'] else 1.0
+    ws_big = 1.2 if status['big'] else 1.0
+
+    co_occ = Counter()
+    for d in all_draws[:100]:
+        for pair in itertools.combinations(sorted(d), 2): co_occ[pair] += 1
+
+    short_heat = Counter([n for d in all_draws[:15] for n in d])
+    long_freq = Counter([n for d in all_draws[:50] for n in d])
     
-    analysis_list = []
+    all_analysis = []
     for i in range(1, 81):
-        score = long_term_freq[i] * 1.0
-        if i in repeat_pool: score += 5.0
-        score *= (odd_weight if i % 2 != 0 else even_weight)
-        score -= (short_term_heat[i] * 2.0)
-        score += (drag_scores[i] * 0.1)
+        f_score = long_freq[i] * 1.0 # 基
+        streak = 0
+        for d in all_draws:
+            if i in d: streak += 1
+            else: break
+        r_score = 5.0 if streak == 1 else 2.0 if streak == 2 else 0.0 # 莊
+        l_penalty = -15.0 if streak >= 3 else 0.0 # 連
+        d_score = sum(co_occ.get(tuple(sorted((i, ln))), 0) for ln in latest_win_nums) * 0.3 # 拖
         
-        analysis_list.append({
-            'no': i, 'repeat': "是" if i in repeat_pool else "否",
-            'score': score, 'drag': drag_scores[i], 'omission': next((idx for idx, d in enumerate(all_draws) if i in d), 99)
+        cur_wp = wp_odd if i % 2 != 0 else wp_even
+        cur_ws = ws_small if i <= 40 else ws_big
+        h_penalty = -(short_heat[i] * 2.0) # 扣
+        
+        final_score = (f_score + r_score + l_penalty + d_score) * cur_wp * cur_ws + h_penalty
+        
+        omission = next((idx for idx, d in enumerate(all_draws) if i in d), 99)
+        all_analysis.append({
+            'no': i, 'score': round(final_score, 1), 'omission': omission, 'section': (i-1)//20,
+            'details': {'基': f_score, '莊': r_score, '連': l_penalty, '拖': round(d_score, 1), '權': f"x{cur_wp*cur_ws:.2f}", '扣': h_penalty}
         })
 
-    # --- 策略 D: 組合生成與特性描述 ---
-    sorted_candidates = sorted(analysis_list, key=lambda x: x['score'], reverse=True)
-    used_nums = set()
-    groups = []
-    group_names = ["第一組 (核心)", "第二組 (潛力)", "第三組 (平衡)"]
+    def select_group(pool, h_c, c_c, used_set):
+        sorted_score = sorted(pool, key=lambda x: x['score'], reverse=True)
+        sorted_omission = sorted(pool, key=lambda x: x['omission'], reverse=True)
+        res = []
+        sec_counts = Counter()
+        for p in sorted_score:
+            if p['no'] not in used_set and len([x for x in res if x['tag']=='熱門']) < h_c:
+                if sec_counts[p['section']] < 2:
+                    p_c = p.copy(); p_c['tag']='熱門'; res.append(p_c); used_set.add(p['no']); sec_counts[p['section']]+=1
+        for p in sorted_omission:
+            if p['no'] not in used_set and len([x for x in res if x['tag']=='冷門']) < c_c:
+                if sec_counts[p['section']] < 2:
+                    p_c = p.copy(); p_c['tag']='冷門'; res.append(p_c); used_set.add(p['no']); sec_counts[p['section']]+=1
+        return res
 
-    for name in group_names:
-        current_picks = []
-        for p in sorted_candidates:
-            if p['no'] not in used_nums and len(current_picks) < 4:
-                sections = Counter([(n['no']-1)//20 for n in current_picks] + [(p['no']-1)//20])
-                if any(c > 2 for c in sections.values()): continue
-                current_picks.append(p)
-                used_nums.add(p['no'])
-        
-        # --- 新增：組合特性分析邏輯 ---
-        p_nums = [p['no'] for p in current_picks]
-        drag_vals = [p['drag'] for p in current_picks]
-        avg_drag = sum(drag_vals) / 4
-        drag_diff = max(drag_vals) - min(drag_vals)
-        
-        # 分類邏輯
-        if avg_drag > 50 and drag_diff < 30:
-            type_desc = "趨勢追蹤型"
-            type_color = "text-emerald-600"
-        elif avg_drag < 30:
-            type_desc = "機率補償型"
-            type_color = "text-rose-600"
-        elif drag_diff > 40:
-            type_desc = "冷熱平衡型"
-            type_color = "text-amber-600"
-        else:
-            type_desc = "穩健中庸型"
-            type_color = "text-indigo-600"
+    used = set()
+    g1 = select_group(all_analysis, 2, 2, used)
+    g2 = select_group(all_analysis, 1, 3, used)
+    g3 = [dict(p, tag="熱門") for p in sorted(all_analysis, key=lambda x: x['score'], reverse=True)[:6]]
 
-        groups.append({
-            'name': name,
-            'picks': current_picks,
-            'nums': p_nums,
-            'diagnosis': {
-                'type_desc': type_desc,
-                'type_color': type_color,
-                'parity': f"{len([n for n in p_nums if n % 2 != 0])}奇{len([n for n in p_nums if n % 2 == 0])}偶",
-                'sections': f"覆蓋 {len(set([(n-1)//20 for n in p_nums]))} 區間",
-                'avg_drag': f"{avg_drag:.1f}"
-            }
-        })
-            
-    return groups, period_range, parity_status
+    results = [
+        {"id":"G1", "name":"第一組 (2熱2冷)", "picks":sorted(g1, key=lambda x:x['no']), "clr":"border-amber-400"},
+        {"id":"G2", "name":"第二組 (1熱3冷)", "picks":sorted(g2, key=lambda x:x['no']), "clr":"border-emerald-400"},
+        {"id":"G3", "name":"第三組 (6星共振)", "picks":sorted(g3, key=lambda x:x['no']), "size":6, "clr":"border-slate-800"}
+    ]
+    return (results, f"奇 {o_day} : 偶 {e_day}", f"小 {s_day} : 大 {b_day}", 
+            f"奇 {o_20} : 偶 {e_20}", f"小 {s_20} : 大 {b_20}", 
+            status, latest_win_nums, latest_no, target_date)
 
 # --- 2. 網頁前端 ---
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    results, period_range, parity_status = get_data_and_analyze()
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+async def index(request: Request, date: str = None):
+    (results, p_day, s_day, p_20, s_20, 
+     status, latest_win, latest_no, active_date) = get_data_and_analyze(date)
     
     html_content = """
     <html>
     <head>
-        <title>量化預測系統 V3.6</title>
+        <title>量化終端 V6.7</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+        <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
         <style>
-            .hit { color: white; background-color: #ef4444 !important; font-weight: bold; border-radius: 8px; box-shadow: 0 4px 10px rgba(239, 68, 68, 0.4); }
+            .hit-highlight { color: white !important; background-color: #ef4444 !important; font-weight: bold; border-radius: 50%; box-shadow: 0 0 15px rgba(239, 68, 68, 0.7); transform: scale(1.1); }
+            .latest-ball { background: #f1f5f9; color: #475569; font-weight: bold; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; border-radius: 50%; font-size: 11px; border: 1px solid #e2e8f0; }
+            .formula-card { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); }
+            .tag-hot { background: #fee2e2; color: #ef4444; border: 1px solid #fecaca; }
+            .tag-cold { background: #e0f2fe; color: #0ea5e9; border: 1px solid #bae6fd; }
+            .status-monitor { display: flex; align-items: center; gap: 6px; font-size: 9px; font-weight: 900; padding: 2px 8px; border-radius: 99px; }
+            .status-active { background: #22c55e; color: white; animation: pulse 2s infinite; }
+            .status-idle { background: rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
         </style>
     </head>
-    <body class="bg-slate-50 p-4 md:p-10 font-sans text-slate-900">
-        <div class="max-w-4xl mx-auto">
-            <div class="bg-white p-6 rounded-t-3xl shadow-sm border-b border-slate-100">
-                <div class="flex flex-col md:flex-row md:justify-between items-center">
-                    <div class="text-center md:text-left">
-                        <h1 class="text-2xl font-black text-slate-800">📊 賓果策略量化儀表板</h1>
-                        <p class="text-slate-400 text-[10px] mt-1 uppercase tracking-widest font-bold">Version 3.6 | Strategy Diagnosis</p>
+    <body class="bg-slate-50 font-sans text-slate-900 pb-20">
+        <div class="max-w-4xl mx-auto p-4 md:p-8">
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+                <div class="bg-indigo-700 text-white p-6 rounded-[2rem] shadow-xl border-2 border-indigo-400">
+                    <div class="flex justify-between items-center mb-4">
+                        <span class="text-[10px] font-black uppercase opacity-80 tracking-widest italic">Parity Monitor</span>
+                        {% if status.odd or status.even %}
+                            <div class="status-monitor status-active">✅ 補償激活 (x1.2)</div>
+                        {% else %}
+                            <div class="status-monitor status-idle">⚪ 監控中 (未達閥值)</div>
+                        {% endif %}
                     </div>
-                    <button onclick="location.reload()" class="mt-4 md:mt-0 flex items-center bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-xl font-bold text-sm transition-all active:scale-95 shadow-lg shadow-indigo-100">
-                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                        更新最新數據
-                    </button>
+                    <div class="grid grid-cols-2 gap-4 border-t border-white/10 pt-4 text-center italic">
+                        <div><p class="text-[8px] opacity-60 uppercase mb-1">今日全天累計</p><p class="text-lg font-black tracking-tighter">{{ p_day }}</p></div>
+                        <div class="border-l border-white/10">
+                            <p class="text-[8px] text-amber-300 font-bold uppercase mb-1 underline">最近 20 期觸發區</p>
+                            <p class="text-xl font-black text-amber-300 tracking-tighter">{{ p_20 }}</p>
+                        </div>
+                    </div>
                 </div>
-                <div class="mt-6 flex justify-between text-[10px] font-mono border-t border-slate-50 pt-4 text-slate-400">
-                    <span>🕒 {{ current_time }}</span>
-                    <span class="text-indigo-500 font-bold">🔢 範圍: {{ period_range }}</span>
+                <div class="bg-emerald-700 text-white p-6 rounded-[2rem] shadow-xl border-2 border-emerald-400">
+                    <div class="flex justify-between items-center mb-4">
+                        <span class="text-[10px] font-black uppercase opacity-80 tracking-widest italic">Size Monitor</span>
+                        {% if status.small or status.big %}
+                            <div class="status-monitor status-active">✅ 補償激活 (x1.2)</div>
+                        {% else %}
+                            <div class="status-monitor status-idle">⚪ 監控中 (未達閥值)</div>
+                        {% endif %}
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 border-t border-white/10 pt-4 text-center italic">
+                        <div><p class="text-[8px] opacity-60 uppercase mb-1">今日全天累計</p><p class="text-lg font-black tracking-tighter">{{ s_day }}</p></div>
+                        <div class="border-l border-white/10">
+                            <p class="text-[8px] text-amber-300 font-bold uppercase mb-1 underline">最近 20 期觸發區</p>
+                            <p class="text-xl font-black text-amber-300 tracking-tighter">{{ s_20 }}</p>
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <div class="bg-slate-900 p-6 shadow-xl text-white">
-                <h3 class="font-bold mb-3 flex items-center text-xs opacity-70 italic">🎯 快速對獎 (支援 021516... 格式)</h3>
-                <textarea id="winningInput" rows="2" 
-                    class="w-full p-4 text-slate-900 rounded-xl border-none focus:ring-4 focus:ring-indigo-500 font-mono text-sm" 
-                    placeholder="請貼入獎號..."></textarea>
-                <button onclick="checkResults()" 
-                    class="mt-4 w-full bg-indigo-500 hover:bg-indigo-600 text-white font-black py-4 rounded-xl shadow-lg transition-all tracking-widest">
-                    執行組合核對
-                </button>
-            </div>
-
-            <div class="bg-white p-6 rounded-b-3xl shadow-sm space-y-12 mb-10">
-                {% if not results %}
-                    <p class="text-center py-20 text-slate-400">數據加載中...</p>
-                {% else %}
-                    {% for group in results %}
-                    <div class="group-container">
-                        <div class="flex justify-between items-center mb-4">
-                            <h2 class="text-lg font-black text-slate-700 flex items-center">
-                                <span class="w-2 h-6 bg-indigo-500 rounded-full mr-3"></span>
-                                {{ group.name }}
-                                <span class="ml-3 text-xs font-bold px-2 py-0.5 rounded-md bg-slate-100 {{ group.diagnosis.type_color }}">
-                                    {{ group.diagnosis.type_desc }}
-                                </span>
-                            </h2>
-                            <span class="hit-badge hidden bg-rose-500 text-white px-3 py-1 rounded-full text-[10px] font-black"></span>
-                        </div>
-                        
-                        <div class="overflow-x-auto rounded-2xl border border-slate-100 mb-4">
-                            <table class="w-full text-sm text-left min-w-[500px]">
-                                <thead class="bg-slate-50 text-slate-400 text-[10px] uppercase font-bold">
-                                    <tr>
-                                        <th class="px-5 py-4">號碼</th>
-                                        <th class="px-5 py-4 text-center">拖牌能量</th>
-                                        <th class="px-4 py-4 text-center">歷史連莊</th>
-                                        <th class="px-5 py-4 text-right">量化得分</th>
-                                    </tr>
-                                </thead>
-                                <tbody class="divide-y divide-slate-50">
-                                    {% for p in group.picks %}
-                                    <tr class="hover:bg-slate-50 transition-colors">
-                                        <td class="px-5 py-4 font-mono font-bold text-xl num-cell" data-val="{{ p.no }}">
-                                            {{ "%02d" | format(p.no) }}
-                                        </td>
-                                        <td class="px-5 py-4 text-center text-indigo-400 font-bold">{{ p.drag }}</td>
-                                        <td class="px-4 py-4 text-center {{ 'text-emerald-500 font-black' if p.repeat == '是' else 'text-slate-200' }}">{{ p.repeat }}</td>
-                                        <td class="px-5 py-4 font-black text-indigo-600 text-right italic">{{ "%.1f" | format(p.score) }}</td>
-                                    </tr>
-                                    {% endfor %}
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div class="bg-slate-50 rounded-2xl p-4 border border-slate-100 grid grid-cols-2 md:grid-cols-3 gap-4 mb-4">
-                            <div class="text-center md:border-r border-slate-200">
-                                <p class="text-[9px] text-slate-400 font-bold uppercase">奇偶比例</p>
-                                <p class="text-xs font-black text-slate-600 mt-1">{{ group.diagnosis.parity }}</p>
-                            </div>
-                            <div class="text-center md:border-r border-slate-200">
-                                <p class="text-[9px] text-slate-400 font-bold uppercase">空間分佈</p>
-                                <p class="text-xs font-black text-slate-600 mt-1">{{ group.diagnosis.sections }}</p>
-                            </div>
-                            <div class="text-center">
-                                <p class="text-[9px] text-slate-400 font-bold uppercase">平均拖牌強度</p>
-                                <p class="text-xs font-black text-indigo-600 mt-1">{{ group.diagnosis.avg_drag }}</p>
-                            </div>
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-4">
-                            <div class="bg-indigo-600 p-4 rounded-2xl shadow-lg shadow-indigo-100">
-                                <p class="text-[9px] text-indigo-200 font-bold uppercase mb-1">四星推薦組合</p>
-                                <p class="text-lg font-black text-white tracking-widest">{{ group.nums | join(', ') }}</p>
-                            </div>
-                            <div class="bg-white p-4 rounded-2xl border-2 border-indigo-600">
-                                <p class="text-[9px] text-indigo-400 font-bold uppercase mb-1">三星推薦組合</p>
-                                <p class="text-lg font-black text-indigo-600 tracking-widest">{{ group.nums[:3] | join(', ') }}</p>
-                            </div>
-                        </div>
-                    </div>
-                    {% endfor %}
-                {% endif %}
+            <div class="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 mb-6 flex justify-between items-center">
+                <h1 class="text-xl font-black text-slate-800 italic tracking-tighter uppercase italic">Quant Terminal V6.7</h1>
+                <button onclick="location.reload()" class="bg-indigo-500 text-white px-5 py-2 rounded-xl text-[10px] font-black shadow-lg">Refresh</button>
             </div>
             
-            <div class="text-center mb-10 bg-indigo-50 py-3 rounded-full border border-indigo-100">
-                <p class="text-[10px] text-indigo-600 font-bold">📊 當前補償壓力：{{ parity_status }}</p>
+            <div class="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 mb-6 text-center">
+                <h3 class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 italic">📢 Latest Draw: {{ latest_no }}</h3>
+                <div class="flex flex-wrap gap-2.5 justify-center">
+                    {% for n in latest_win %}<div class="latest-ball" data-val="{{ n }}">{{ "%02d" | format(n) }}</div>{% endfor %}
+                </div>
+            </div>
+
+            <div id="compBox" class="bg-slate-900 p-8 rounded-[2.5rem] shadow-2xl text-white mb-10 text-center border-4 border-slate-800">
+                <div class="grid grid-cols-3 md:grid-cols-6 gap-3 mb-6">
+                    {% for i in range(1, 7) %}<input type="text" id="myNum{{i}}" maxlength="2" class="h-14 text-center text-2xl font-black text-white bg-slate-800 rounded-2xl border-2 border-slate-700 outline-none focus:border-indigo-400" placeholder="--">{% endfor %}
+                </div>
+                <button onclick="startComparison()" class="w-full bg-indigo-500 text-white font-black py-4 rounded-xl text-sm uppercase tracking-widest">執行對獎</button>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-20">
+                {% for group in results %}
+                <div class="bg-white p-5 rounded-3xl shadow-sm border-4 {{ group.clr }} flex flex-col">
+                    <div class="flex justify-between items-start mb-4"><h2 class="text-[10px] font-black text-slate-800 uppercase italic">{{ group.name }}</h2><button onclick="toggleDetail('{{ group.id }}')" class="text-[8px] bg-slate-100 px-2 py-1 rounded font-bold uppercase">Detail</button></div>
+                    <div class="grid {{ 'grid-cols-3' if group.id == 'G3' else 'grid-cols-2' }} gap-2.5 mb-4">
+                        {% for p in group.picks %}<div class="bg-slate-50 pt-6 pb-4 rounded-2xl text-center relative overflow-hidden num-card" data-val="{{ p.no }}"><span class="absolute top-0 left-0 w-full text-[7px] font-black py-0.5 {{ 'tag-hot' if p.tag == '熱門' else 'tag-cold' }}">{{ p.tag }}</span><p class="text-2xl font-black text-slate-800 font-mono">{{ "%02d" | format(p.no) }}</p></div>{% endfor %}
+                    </div>
+                    <div id="detail-{{ group.id }}" class="strategy-detail bg-slate-50 p-3 rounded-xl mb-4 text-[8px] font-bold text-slate-500 space-y-1">
+                        {% for p in group.picks %}<div class="flex justify-between border-b border-slate-100 pb-1"><span>No.{{ "%02d" | format(p.no) }}</span><span>基:{{p.details['基']}}|權:{{p.details['權']}}|拖:{{p.details['拖']}}|扣:{{p.details['扣']}}</span></div>{% endfor %}
+                    </div>
+                    <button onclick='quickFill({{ group.picks | map(attribute="no") | list | tojson }})' class="mt-auto w-full bg-slate-900 text-white py-3 rounded-xl text-[10px] font-black tracking-widest transition-all">🚀 快速對獎</button>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="mt-20 border-t-2 border-slate-200 pt-10">
+                <div class="flex items-center space-x-3 mb-10"><div class="w-3 h-8 bg-indigo-600 rounded-full"></div><h2 class="text-2xl font-black text-slate-800 tracking-tighter italic uppercase">Technical Whitepaper V6.7</h2></div>
+
+                <div class="formula-card p-12 rounded-[3.5rem] shadow-2xl text-white mb-12 text-center border border-white/10">
+                    <p class="text-[10px] font-bold text-indigo-300 uppercase tracking-[0.4em] mb-6 underline underline-offset-8">Master Scoring Model</p>
+                    <div class="text-xl md:text-3xl font-serif italic mb-6">
+                        $$Score = \\left( \\text{基} + \\text{莊} + \\text{連} + \\text{拖} \\right) \\times W_p \\times W_s + \\text{扣}$$
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 text-sm">
+                    <div class="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100 space-y-6">
+                        <div>
+                            <h3 class="font-black text-indigo-500 mb-2 italic">01. 基 (Base Frequency)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed">過去 50 期長期出現頻率，決定號碼的核心慣性動能。</p>
+                        </div>
+                        <div>
+                            <h3 class="font-black text-emerald-500 mb-2 italic">02. 莊 (Streak Bonus)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed">連 1 期 **+5.0**，連 2 期 **+2.0**，捕捉短期出球爆發力。</p>
+                        </div>
+                        <div>
+                            <h3 class="font-black text-rose-500 mb-2 italic">03. 連 (Exhaustion Penalty)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed">「連莊不破三」原則。連續產出 $$ \\ge 3 $$ 期則判定能量耗盡，強制扣除 **15.0 分**。</p>
+                        </div>
+                        <div>
+                            <h3 class="font-black text-amber-500 mb-2 italic">04. 拖 (Synergy Drag)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed">分析 100 期兩兩共現機率，計算與最新獎號的引力總和 $\\sum f_{i, latest}$ 並乘 **0.3**。</p>
+                        </div>
+                    </div>
+
+                    <div class="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100 space-y-6">
+                        <div>
+                            <h3 class="font-black text-blue-500 mb-2 italic uppercase">05. $$W_p$$ (Parity Weight)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed mb-3">
+                                偵測近 20 期 (400球) 奇偶比。低於 **160 (40%)** 時觸發補償權重。
+                            </p>
+                            <div class="bg-slate-50 p-3 rounded-xl text-[10px] font-mono">
+                                $$W = \\begin{cases} 1.2 & n \\le 160 \\\\ 1.0 & n > 160 \\end{cases}$$
+                            </div>
+                        </div>
+                        <div>
+                            <h3 class="font-black text-cyan-500 mb-2 italic uppercase">06. $$W_s$$ (Size Weight)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed mb-3">
+                                偵測近 20 期大小比。規則同奇偶補償，若雙重疊加觸發，權重可達 **1.44 倍**。
+                            </p>
+                        </div>
+                        <div>
+                            <h3 class="font-black text-slate-400 mb-2 italic uppercase">07. 扣 (Heat Filter)</h3>
+                            <p class="text-[11px] text-slate-500 leading-relaxed">
+                                偵測近 15 期過熱度，每開出一期扣 **2.0 分**，防止盲目追高導致勝率下降。
+                            </p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
         <script>
-            function checkResults() {
-                let input = document.getElementById('winningInput').value.trim();
-                let winningNums = [];
-                if (!input.includes(' ') && !input.includes(',') && input.length >= 20) {
-                    for (let i = 0; i < input.length; i += 2) {
-                        let num = parseInt(input.substring(i, i + 2));
-                        if (!isNaN(num)) winningNums.push(num);
-                    }
-                } else {
-                    let matches = input.match(/\d+/g);
-                    if (matches) winningNums = matches.map(Number);
-                }
-                if (winningNums.length === 0) return alert('請輸入號碼');
-                document.querySelectorAll('.num-cell').forEach(c => c.classList.remove('hit'));
-                document.querySelectorAll('.hit-badge').forEach(b => b.classList.add('hidden'));
-                document.querySelectorAll('.group-container').forEach(container => {
-                    let hits = 0;
-                    container.querySelectorAll('.num-cell').forEach(cell => {
-                        if (winningNums.includes(parseInt(cell.getAttribute('data-val')))) {
-                            cell.classList.add('hit'); hits++;
-                        }
-                    });
-                    const badge = container.querySelector('.hit-badge');
-                    if (hits > 0) { badge.innerText = `命中 ${hits} 碼`; badge.classList.remove('hidden'); }
-                });
+            function toggleDetail(id) { const el = document.getElementById('detail-' + id); el.style.display = (el.style.display === "block") ? "none" : "block"; }
+            function quickFill(numbers) {
+                for (let i = 1; i <= 6; i++) document.getElementById('myNum' + i).value = "";
+                numbers.forEach((num, index) => { if (index < 6) document.getElementById('myNum' + (index + 1)).value = num.toString().padStart(2, '0'); });
+                startComparison(); document.getElementById('compBox').scrollIntoView({ behavior: 'smooth' });
+            }
+            function startComparison() {
+                const winNums = Array.from(document.querySelectorAll('.latest-ball')).map(el => parseInt(el.dataset.val));
+                const myInputs = []; for(let i=1; i<=6; i++) { let val = document.getElementById('myNum' + i).value; if(val !== "") myInputs.push(Number(val)); }
+                if (myInputs.length < 3) return alert('請輸入至少 3 個號碼');
+                document.querySelectorAll('.latest-ball').forEach(ball => ball.classList.remove('hit-highlight'));
+                document.querySelectorAll('.num-card').forEach(card => card.classList.remove('hit-highlight'));
+                myInputs.forEach(myNum => { if (winNums.includes(myNum)) { 
+                    document.querySelector(`.latest-ball[data-val="${myNum}"]`)?.classList.add('hit-highlight'); 
+                    document.querySelectorAll(`.num-card[data-val="${myNum}"]`).forEach(c => c.classList.add('hit-highlight')); 
+                } });
             }
         </script>
     </body>
@@ -291,11 +302,11 @@ async def index(request: Request):
     """
     from jinja2 import Template
     template = Template(html_content)
-    return template.render(results=results, period_range=period_range, parity_status=parity_status, current_time=current_time)
-
+    return template.render(results=results, p_day=p_day, s_day=s_day, p_20=p_20, s_20=s_20, status=status, latest_win=latest_win, latest_no=latest_no, active_date=active_date)
 
 if __name__ == "__main__":
     # 提醒：若要部屬到 Render，host 需設為 "0.0.0.0"
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
