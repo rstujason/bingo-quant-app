@@ -50,7 +50,7 @@ def get_data_and_analyze(target_date=None, mode_exclusive=True):
     latest_win_nums = all_draws[0] if all_draws else []
     
     co_occ = Counter()
-    for d in all_draws[:100]: 
+    for d in all_draws[:200]: 
         for pair in itertools.combinations(sorted(d), 2): co_occ[pair] += 1
     
     recent_20 = all_draws[:20]
@@ -430,17 +430,6 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
     template = Template(html_content)
     return template.render(res_3star=res_3star, res_4star=res_4star, p_day=p_day, s_day=s_day, p_20=p_20, s_20=s_20, status=status, latest_win=latest_win, latest_no=latest_no, latest_time=latest_time, active_date=active_date, exclusive=exclusive, recent_history=recent_history)
 
+
 if __name__ == "__main__":
-    # 提醒：若要部屬到 Render，host 需設為 "0.0.0.0"
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
-
-
-
-
-
-
