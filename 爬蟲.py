@@ -9,9 +9,9 @@ import json
 
 app = FastAPI()
 
-# --- 1. 核心量化分析邏輯 (穩定 V8.9 核心) ---
+# --- 1. 核心量化分析邏輯 (V9.2：核心收斂與 100 期跨日版) ---
 
-def get_data_and_analyze(target_date=None):
+def get_data_and_analyze(target_date=None, mode_exclusive=True):
     now = datetime.datetime.now()
     if not target_date: target_date = now.strftime("%Y-%m-%d")
     yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -24,6 +24,7 @@ def get_data_and_analyze(target_date=None):
             return resp.json() if resp.status_code == 200 else []
         except: return []
 
+    # 跨日聚合數據
     data_today = fetch_api(target_date)
     data_yesterday = fetch_api(yesterday)
     full_raw_data = data_today + data_yesterday 
@@ -41,10 +42,12 @@ def get_data_and_analyze(target_date=None):
     latest_no = full_raw_data[0].get('No', 'N/A')
     latest_win_nums = all_draws[0] if all_draws else []
     
+    # --- 100 期精準引力矩陣 ---
     co_occ = Counter()
     for d in all_draws[:100]: 
         for pair in itertools.combinations(sorted(d), 2): co_occ[pair] += 1
 
+    # 最近 20 期補償判定
     recent_20 = all_draws[:20]
     o_20 = len([n for d in recent_20 for n in d if n % 2 != 0]); e_20 = 400 - o_20
     s_20 = len([n for d in recent_20 for n in d if n <= 40]); b_20 = 400 - s_20
@@ -59,24 +62,33 @@ def get_data_and_analyze(target_date=None):
         for d in all_draws:
             if i in d: streak += 1
             else: break
-        l_penalty = -15.0 if streak >= 3 else 0.0
+        l_penalty = -15.0 if streak >= 3 else 0.0 # 連莊避讓
         cur_wp = 1.2 if (i%2!=0 and status['odd']) or (i%2==0 and status['even']) else 1.0
         cur_ws = 1.2 if (i<=40 and status['small']) or (i>40 and status['big']) else 1.0
+        
         final_score = (long_freq[i] + (5.0 if streak==1 else 2.0 if streak==2 else 0) + l_penalty) * cur_wp * cur_ws - (short_heat[i]*2.0)
         all_analysis.append({'no': i, 'score': round(final_score, 1)})
 
     def get_synergy(n1, n2): return co_occ.get(tuple(sorted((n1, n2))), 0)
 
-    def generate_squads(pool, size, count):
+    # 策略生成 (Top 1-10 領頭羊重疊)
+    def generate_squads(pool, size, count, exclusive):
         squads = []
+        global_used = set()
         sorted_seeds = sorted(pool, key=lambda x: x['score'], reverse=True)[:count]
         for i, seed in enumerate(sorted_seeds):
-            partners = sorted([p for p in pool if p['no'] != seed['no']], key=lambda x: (get_synergy(seed['no'], x['no']), x['score']), reverse=True)[:size-1]
-            squads.append({"id": i+1, "picks": [n['no'] for n in sorted([seed] + partners, key=lambda x:x['no'])]})
+            seed_no = seed['no']
+            avoid = global_used if exclusive else {seed_no}
+            partners = sorted([p for p in pool if p['no'] not in avoid and p['no'] != seed_no], 
+                              key=lambda x: (get_synergy(seed_no, x['no']), x['score']), reverse=True)[:size-1]
+            squad_nos = [seed_no] + [p['no'] for p in partners]
+            if exclusive:
+                for n in squad_nos: global_used.add(n)
+            squads.append({"id": i+1, "picks": sorted(squad_nos)})
         return squads
 
-    res_3star = generate_squads(all_analysis, 3, 10)
-    res_6star = generate_squads(all_analysis, 6, 10)
+    res_3star = generate_squads(all_analysis, 3, 10, mode_exclusive)
+    res_6star = generate_squads(all_analysis, 6, 10, mode_exclusive)
 
     today_draws = [ [int(x) for x in item.get('BigShowOrder','').split(',') if x.strip().isdigit()] for item in data_today if item.get('BigShowOrder','') ]
     today_balls = [n for d in today_draws if len(d)==20 for n in d]
@@ -85,16 +97,16 @@ def get_data_and_analyze(target_date=None):
 
     return (res_3star, res_6star, p_day, s_day, f"{o_20}:{e_20}", f"{s_20}:{b_20}", status, latest_win_nums, latest_no, target_date)
 
-# --- 2. 網頁前端 (新增 Load All 功能) ---
+# --- 2. 網頁前端 ---
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request, date: str = None):
-    (res_3star, res_6star, p_day, s_day, p_20, s_20, status, latest_win, latest_no, active_date) = get_data_and_analyze(date)
+async def index(request: Request, date: str = None, exclusive: bool = True):
+    (res_3star, res_6star, p_day, s_day, p_20, s_20, status, latest_win, latest_no, active_date) = get_data_and_analyze(date, exclusive)
     
     html_content = """
     <html>
     <head>
-        <title>量化矩陣 V9.0 一鍵裝載版</title>
+        <title>量化矩陣 V9.2 修正版</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
@@ -112,17 +124,20 @@ async def index(request: Request, date: str = None):
             .latest-ball { background: #f1f5f9; color: #475569; font-weight: bold; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; border-radius: 50%; font-size: 13px; border: 1px solid #e2e8f0; transition: all 0.3s; }
             .stat-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); padding: 6px; border-radius: 12px; text-align: center; position: relative; }
             .miss-badge { position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; font-size: 8px; font-weight: 900; padding: 1px 4px; border-radius: 4px; }
-            .profit-input { background: #1e293b; border: 1px solid #334155; color: #f1f5f9; text-align: center; border-radius: 8px; font-weight: bold; width: 100%; height: 32px; }
-
-            .dist-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; background: #fefce8; padding: 12px; border-radius: 16px; border: 2px solid #fde047; }
-            .dist-ball { background: #ffffff; color: #64748b; font-weight: bold; font-size: 10px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 8px; border: 1px solid #e2e8f0; transition: all 0.3s; }
-            .active-3s { background: #f59e0b !important; color: white !important; box-shadow: 0 0 10px #f59e0b; border-color: #f59e0b; }
-            .active-6s { background: #6366f1 !important; color: white !important; box-shadow: 0 0 10px #6366f1; border-color: #6366f1; }
+            .alert-gold { animation: gold-blink 1s infinite alternate; }
+            @keyframes gold-blink { from { box-shadow: 0 0 5px #fbbf24; background: #1e293b; } to { box-shadow: 0 0 25px #f59e0b; background: #fbbf24; } }
             
-            .control-btn { color: white; padding: 2px 10px; border-radius: 6px; font-size: 8px; font-weight: 900; text-transform: uppercase; transition: all 0.2s; }
-            .btn-clear { background: #991b1b; }
-            .btn-load { background: #065f46; }
-            .control-btn:hover { opacity: 0.8; transform: scale(1.05); }
+            .dist-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; background: #fefce8; padding: 12px; border-radius: 16px; border: 2px solid #fde047; }
+            .dist-ball { background: #ffffff; color: #64748b; font-weight: bold; font-size: 10px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 8px; border: 1px solid #e2e8f0; }
+            .active-3s { background: #f59e0b !important; color: white !important; }
+            .active-6s { background: #6366f1 !important; color: white !important; }
+            
+            .switch { position: relative; display: inline-block; width: 40px; height: 20px; }
+            .switch input { opacity: 0; width: 0; height: 0; }
+            .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 20px; }
+            .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+            input:checked + .slider { background-color: #6366f1; }
+            input:checked + .slider:before { transform: translateX(20px); }
         </style>
     </head>
     <body class="bg-slate-50 font-sans text-slate-900 pb-20 text-[12px]">
@@ -132,7 +147,7 @@ async def index(request: Request, date: str = None):
                 <div class="bg-indigo-700 text-white p-6 rounded-[2rem] shadow-xl border-2 border-indigo-400">
                     <div class="flex justify-between items-center mb-4"><span class="text-[10px] font-black uppercase italic">Parity Monitor</span>{% if status.odd or status.even %}<div class="bg-green-500 text-[8px] font-black px-2 py-1 rounded-full animate-pulse">✅ 補償激活</div>{% endif %}</div>
                     <div class="grid grid-cols-2 gap-4 border-t border-white/10 pt-4 text-center italic">
-                        <div><p class="text-[8px] opacity-60">今日累計</p><p class="text-lg font-black italic">奇 {{ p_day }} 偶</p></div>
+                        <div><p class="text-[8px] opacity-60">今日累計</p><p class="text-lg font-black tracking-tighter">奇 {{ p_day }} 偶</p></div>
                         <div class="border-l border-white/10"><p class="text-[8px] text-amber-300 font-bold underline">近 20 期觸發</p><p class="text-xl font-black text-amber-300">{{ p_20 }}</p></div>
                     </div>
                 </div>
@@ -147,22 +162,22 @@ async def index(request: Request, date: str = None):
 
             <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-10">
                 <div class="lg:col-span-3 bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
-                    <div class="flex justify-between items-center mb-6 border-b pb-4 text-slate-400 italic">
+                    <div class="flex justify-between items-center mb-6 border-b pb-4 italic text-slate-400">
                         <h3 class="text-xs font-black uppercase">📢 Latest Draw: <span class="text-indigo-600">{{ latest_no }}</span></h3>
-                        <button onclick="location.reload()" class="bg-indigo-500 text-white px-4 py-1.5 rounded-xl text-[10px] font-black shadow-lg">Refresh</button>
+                        <button onclick="location.reload()" class="bg-indigo-500 text-white px-4 py-1.5 rounded-xl text-[10px] font-black shadow-lg active:scale-95">Refresh Data</button>
                     </div>
                     <div class="space-y-6">
-                        <div><p class="text-[9px] font-black text-amber-500 mb-2 uppercase">3-Star Tracking</p>
+                        <div><p class="text-[9px] font-black text-amber-500 mb-2 uppercase tracking-widest">3-Star Matrix Tracking</p>
                             <div class="flex flex-wrap gap-2 justify-center">{% for n in latest_win %}<div class="latest-ball ball-3s" data-val="{{ n }}">{{ "%02d" | format(n) }}</div>{% endfor %}</div>
                         </div>
-                        <div><p class="text-[9px] font-black text-indigo-500 mb-2 uppercase">6-Star Tracking</p>
+                        <div><p class="text-[9px] font-black text-indigo-500 mb-2 uppercase tracking-widest">6-Star Matrix Tracking</p>
                             <div class="flex flex-wrap gap-2 justify-center">{% for n in latest_win %}<div class="latest-ball ball-6s" data-val="{{ n }}">{{ "%02d" | format(n) }}</div>{% endfor %}</div>
                         </div>
                     </div>
                 </div>
 
-                <div class="bg-slate-900 p-5 rounded-3xl shadow-xl border-4 border-slate-800 text-white">
-                    <h4 class="text-center text-[9px] font-black text-indigo-400 uppercase tracking-widest mb-4">Battle Report</h4>
+                <div class="bg-slate-900 p-5 rounded-3xl shadow-xl border-4 border-slate-800 text-white relative">
+                    <h4 class="text-center text-[9px] font-black text-indigo-400 uppercase tracking-widest mb-4 italic">Battle Report</h4>
                     <div class="space-y-4">
                         <div class="bg-slate-800/50 p-3 rounded-2xl border border-slate-700">
                             <p class="text-[7px] font-black text-amber-500 mb-2 uppercase">3-Star Stats</p>
@@ -176,32 +191,33 @@ async def index(request: Request, date: str = None):
                             <div class="grid grid-cols-2 gap-2">
                                 <div class="stat-card"><p class="text-[6px] text-slate-400">中 3</p><p class="text-sm font-black" id="count-6s-3">0</p></div>
                                 <div class="stat-card"><p class="text-[6px] text-slate-400">中 4</p><p class="text-sm font-black" id="count-6s-4">0</p></div>
-                                <div class="stat-card" id="alert-6s-5"><p class="text-[6px] text-slate-400">中 5</p><p class="text-sm font-black text-amber-300" id="count-6s-5">0</p></div>
-                                <div class="stat-card" id="alert-6s-6"><p class="text-[6px] text-slate-400">全中</p><p class="text-sm font-black text-amber-400" id="count-6s-6">0</p><div class="miss-badge" id="miss-6s-disp">0</div></div>
+                                <div class="stat-card"><p class="text-[6px] text-slate-400">中 5</p><p class="text-sm font-black" id="count-6s-5">0</p></div>
+                                <div class="stat-card" id="alert-6s-all"><p class="text-[6px] text-slate-400">全中</p><p class="text-sm font-black text-amber-400" id="count-6s-6">0</p><div class="miss-badge" id="miss-6s-disp">0</div></div>
                             </div>
                         </div>
                     </div>
+                    <button onclick="resetMissCounters()" class="w-full mt-4 bg-slate-800 text-slate-500 text-[7px] py-1 rounded hover:text-white uppercase font-black">Reset Counters</button>
                 </div>
             </div>
 
             <div class="bg-slate-900 p-8 rounded-[3rem] shadow-2xl border-4 border-slate-800 text-white mb-10">
-                <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.5em] text-emerald-400 italic">Profit Analysis Terminal</h3>
+                <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4 text-emerald-400">
+                    <h3 class="text-[11px] font-black uppercase tracking-[0.5em] italic">Cumulative Profit Analysis</h3>
                     <div class="flex gap-4">
-                        <div class="text-right"><p class="text-[8px] text-slate-400 uppercase">Investment</p><p class="text-lg font-mono font-black" id="display-total-cost">$ 0</p></div>
-                        <div class="text-right border-l border-slate-700 pl-4"><p class="text-[8px] text-slate-400 uppercase">Net Profit</p><p class="text-lg font-mono font-black text-emerald-400" id="display-net-profit">$ 0</p></div>
+                        <div class="text-right"><p class="text-[8px] text-slate-400 uppercase">Cost</p><p class="text-lg font-mono font-black" id="display-total-cost">$ 0</p></div>
+                        <div class="text-right border-l border-slate-700 pl-4"><p class="text-[8px] text-slate-400 uppercase">Net</p><p class="text-lg font-mono font-black text-emerald-400" id="display-net-profit">$ 0</p></div>
                     </div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
                     <div class="bg-slate-800/50 p-4 rounded-2xl">
                         <p class="text-[9px] font-black text-slate-400 uppercase italic mb-2">Investment</p>
-                        <input type="number" id="in-sets" class="profit-input" oninput="calculateProfit()" placeholder="購買組數">
+                        <input type="number" id="in-sets" class="profit-input" oninput="calculateProfit()" placeholder="總組數">
                     </div>
                     <div class="bg-slate-800/50 p-4 rounded-2xl">
                         <p class="text-[9px] font-black text-amber-500 uppercase italic mb-2">3-Star Prize</p>
                         <div class="grid grid-cols-2 gap-2">
-                            <input type="number" id="in-3h2" class="profit-input" oninput="calculateProfit()" placeholder="三中二">
-                            <input type="number" id="in-3h3" class="profit-input" oninput="calculateProfit()" placeholder="三中三">
+                            <input type="number" id="in-3h2" class="profit-input" oninput="calculateProfit()" placeholder="中2">
+                            <input type="number" id="in-3h3" class="profit-input" oninput="calculateProfit()" placeholder="全中">
                         </div>
                     </div>
                     <div class="bg-slate-800/50 p-4 rounded-2xl">
@@ -228,35 +244,33 @@ async def index(request: Request, date: str = None):
             </div>
 
             <div class="space-y-8 mb-20">
-                <div class="bg-slate-900 p-8 rounded-[2.5rem] shadow-2xl border-4 border-slate-800">
-                    <div class="flex justify-between items-center mb-6 px-2">
-                        <h3 class="text-[10px] font-black uppercase tracking-[0.5em] text-amber-400 italic">3-Star Matrix (Top 10)</h3>
-                        <div class="flex gap-2">
-                            <button onclick="loadAllStrategies('3s')" class="control-btn btn-load">Load All 3S</button>
-                            <button onclick="clearMatrix('3s')" class="control-btn btn-clear">Clear All 3S</button>
-                        </div>
+                <div class="bg-slate-900 p-8 rounded-[3rem] shadow-2xl border-4 border-slate-800">
+                    <div class="flex justify-between items-center mb-6 px-2 text-amber-400 italic">
+                        <h3 class="text-[10px] font-black uppercase tracking-[0.5em]">3-Star Matrix</h3>
+                        <div class="flex gap-2"><button onclick="loadAllStrategies('3s')" class="bg-green-700 text-white px-3 py-1 rounded-md text-[8px] font-black uppercase">Load All 3S</button><button onclick="clearMatrix('3s')" class="bg-red-900 text-white px-3 py-1 rounded-md text-[8px] font-black uppercase">Clear All</button></div>
                     </div>
                     <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
                         {% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-slate-500">SET {{ i }}</p><div class="flex gap-1">{% for j in range(1, 4) %}<input type="text" id="3s-g{{i}}n{{j}}" class="w-full h-8 text-center text-sm font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}
                     </div>
                 </div>
-                <div class="bg-slate-900 p-8 rounded-[2.5rem] shadow-2xl border-4 border-slate-800">
-                    <div class="flex justify-between items-center mb-6 px-2">
-                        <h3 class="text-[10px] font-black uppercase tracking-[0.5em] text-indigo-400 italic">6-Star Matrix (Top 10)</h3>
-                        <div class="flex gap-2">
-                            <button onclick="loadAllStrategies('6s')" class="control-btn btn-load">Load All 6S</button>
-                            <button onclick="clearMatrix('6s')" class="control-btn btn-clear">Clear All 6S</button>
-                        </div>
+                <div class="bg-slate-900 p-8 rounded-[3rem] shadow-2xl border-4 border-slate-800">
+                    <div class="flex justify-between items-center mb-6 px-2 text-indigo-400 italic">
+                        <h3 class="text-[10px] font-black uppercase tracking-[0.5em]">6-Star Matrix</h3>
+                        <div class="flex gap-2"><button onclick="loadAllStrategies('6s')" class="bg-indigo-700 text-white px-3 py-1 rounded-md text-[8px] font-black uppercase">Load All 6S</button><button onclick="clearMatrix('6s')" class="bg-red-900 text-white px-3 py-1 rounded-md text-[8px] font-black uppercase">Clear All</button></div>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
-                        {% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-indigo-300">SQUAD {{ i }}</p><div class="grid grid-cols-3 gap-1">{% for j in range(1, 7) %}<input type="text" id="6s-g{{i}}n{{j}}" class="w-full h-8 text-center text-[10px] font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}
+                        {% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-indigo-300">SQUAD {{ i }}</p><div class="grid grid-cols-3 gap-1">{% for j in range(1, 7) %}<input type="text" id="6s-g{{i}}n{{j}}" class="w-full h-8 text-center text-sm font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}
                     </div>
                 </div>
             </div>
 
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-20">
+            <div class="flex justify-between items-center mb-6 px-2">
+                <h2 class="text-sm font-black text-slate-800 uppercase italic border-l-4 border-indigo-500 pl-3">🚀 Strategy Squads</h2>
+                <div class="flex items-center gap-2"><span class="text-[9px] font-black text-slate-500 uppercase">排他模式</span><label class="switch"><input type="checkbox" id="exclusive-toggle" {% if exclusive %}checked{% endif %} onchange="toggleExclusive()"><span class="slider"></span></label></div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
                 {% for sq in res_3star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center text-[9px] font-black uppercase">G{{ sq.id }} (3S)<div class="flex justify-center gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white px-1.5 rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("3s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-amber-50 text-amber-600 py-1 rounded">Load</button></div>{% endfor %}
-                {% for sq in res_6star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center text-[9px] font-black text-indigo-400 uppercase">S{{ sq.id }} (6S)<div class="grid grid-cols-3 gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("6s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-indigo-50 text-indigo-600 py-1 rounded">Load</button></div>{% endfor %}
+                {% for sq in res_6star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center text-[9px] font-black text-indigo-400 uppercase">S{{ sq.id }} (6S)<div class="grid grid-cols-3 gap-1 my-2">{% for p in sq.picks %}<span class="bg-slate-900 text-white rounded">{{ "%02d" | format(p) }}</span>{% endfor %}</div><button onclick='quickFill("6s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-indigo-50 text-indigo-600 py-1 rounded">Load</button></div>{% endfor %}
             </div>
         </div>
 
@@ -266,97 +280,46 @@ async def index(request: Request, date: str = None):
             const server3S = {{ res_3star | tojson }};
             const server6S = {{ res_6star | tojson }};
 
-            // --- 🚀 V9.0 全自動裝載邏輯 ---
+            // --- ⚙️ 排他模式切換 ---
+            function toggleExclusive() { const isChecked = document.getElementById('exclusive-toggle').checked; window.location.href = `/?exclusive=${isChecked}`; }
+
+            // --- 🧹 清除與加載 ---
+            function clearMatrix(type) {
+                const size = (type === '3s') ? 3 : 6;
+                for(let i=1; i<=10; i++) { for(let j=1; j<=size; j++) document.getElementById(`${type}-g${i}n${j}`).value = ""; }
+                saveAndCompare();
+            }
+
             function loadAllStrategies(type) {
                 const data = type === '3s' ? server3S : server6S;
                 const size = type === '3s' ? 3 : 6;
-                data.forEach(sq => {
-                    sq.picks.forEach((n, idx) => {
-                        const inputId = `${type}-g${sq.id}n${idx+1}`;
-                        const el = document.getElementById(inputId);
-                        if(el) el.value = n.toString().padStart(2, '0');
-                    });
-                });
+                data.forEach(sq => { sq.picks.forEach((n, idx) => { const el = document.getElementById(`${type}-g${sq.id}n${idx+1}`); if(el) el.value = n.toString().padStart(2, '0'); }); });
                 saveAndCompare();
             }
 
-            function clearMatrix(type) {
-                const size = (type === '3s') ? 3 : 6;
-                for(let i=1; i<=10; i++) {
-                    for(let j=1; j<=size; j++) document.getElementById(`${type}-g${i}n${j}`).value = "";
-                }
-                saveAndCompare();
-            }
+            function quickFill(type, id, numbers) { numbers.forEach((n, j) => document.getElementById(`${type}-g${id}n${j+1}`).value = n.toString().padStart(2, '0')); saveAndCompare(); }
 
+            // --- 💰 收益計算 ---
             function calculateProfit() {
-                const sets = parseInt(document.getElementById('in-sets').value) || 0;
-                const cost = sets * 25;
-                const prizes = {
-                    s3h2: (parseInt(document.getElementById('in-3h2').value) || 0) * 50,
-                    s3h3: (parseInt(document.getElementById('in-3h3').value) || 0) * 1000,
-                    s6h3: (parseInt(document.getElementById('in-6h3').value) || 0) * 25,
-                    s6h4: (parseInt(document.getElementById('in-6h4').value) || 0) * 200,
-                    s6h5: (parseInt(document.getElementById('in-6h5').value) || 0) * 1200,
-                    s6h6: (parseInt(document.getElementById('in-6h6').value) || 0) * 50000
-                };
-                const totalPrize = Object.values(prizes).reduce((a, b) => a + b, 0);
-                const netProfit = totalPrize - cost;
+                const cost = (parseInt(document.getElementById('in-sets').value) || 0) * 25;
+                const total = (parseInt(document.getElementById('in-3h2').value)||0)*50 + (parseInt(document.getElementById('in-3h3').value)||0)*1000 + (parseInt(document.getElementById('in-6h3').value)||0)*25 + (parseInt(document.getElementById('in-6h4').value)||0)*200 + (parseInt(document.getElementById('in-6h5').value)||0)*1200 + (parseInt(document.getElementById('in-6h6').value)||0)*50000;
+                const net = total - cost;
                 document.getElementById('display-total-cost').innerText = "$ " + cost;
-                const netDisp = document.getElementById('display-net-profit');
-                netDisp.innerText = "$ " + netProfit;
-                netDisp.className = netProfit >= 0 ? "text-lg font-mono font-black text-emerald-400" : "text-lg font-mono font-black text-rose-500";
-                const profitData = { sets, s3h2: document.getElementById('in-3h2').value, s3h3: document.getElementById('in-3h3').value, s6h3: document.getElementById('in-6h3').value, s6h4: document.getElementById('in-6h4').value, s6h5: document.getElementById('in-6h5').value, s6h6: document.getElementById('in-6h6').value };
-                localStorage.setItem('bingo_profit_v90', JSON.stringify(profitData));
+                const netDisp = document.getElementById('display-net-profit'); netDisp.innerText = "$ " + net;
+                netDisp.className = net >= 0 ? "text-lg font-mono font-black text-emerald-400" : "text-lg font-mono font-black text-rose-500";
+                const profitData = { sets: document.getElementById('in-sets').value, s3h2: document.getElementById('in-3h2').value, s3h3: document.getElementById('in-3h3').value, s6h3: document.getElementById('in-6h3').value, s6h4: document.getElementById('in-6h4').value, s6h5: document.getElementById('in-6h5').value, s6h6: document.getElementById('in-6h6').value };
+                localStorage.setItem('bingo_profit_v92', JSON.stringify(profitData));
             }
 
+            // --- 📊 對獎比對中心 ---
             function saveAndCompare() {
                 const data = { s3: {}, s6: {} };
                 for(let i=1; i<=10; i++) {
                     data.s3[i] = [1,2,3].map(j => document.getElementById(`3s-g${i}n${j}`).value);
                     data.s6[i] = [1,2,3,4,5,6].map(j => document.getElementById(`6s-g${i}n${j}`).value);
                 }
-                localStorage.setItem('bingo_v90_matrix', JSON.stringify(data));
+                localStorage.setItem('bingo_v92_matrix', JSON.stringify(data));
                 executeComparison();
-            }
-
-            function loadMatrix() {
-                const saved = localStorage.getItem('bingo_v90_matrix');
-                if(saved) {
-                    const d = JSON.parse(saved);
-                    for(let i=1; i<=10; i++) {
-                        if(d.s3[i]) d.s3[i].forEach((v, j) => document.getElementById(`3s-g${i}n${j+1}`).value = v);
-                        if(d.s6[i]) d.s6[i].forEach((v, j) => document.getElementById(`6s-g${i}n${j+1}`).value = v);
-                    }
-                }
-                const savedProfit = localStorage.getItem('bingo_profit_v90');
-                if(savedProfit) {
-                    const d = JSON.parse(savedProfit);
-                    document.getElementById('in-sets').value = d.sets || "";
-                    ['3h2', '3h3', '6h3', '6h4', '6h5', '6h6'].forEach(k => { if(document.getElementById('in-'+k)) document.getElementById('in-'+k).value = d['s'+k] || ""; });
-                    calculateProfit();
-                }
-                executeComparison();
-                handleMissCounter();
-            }
-
-            function handleMissCounter() {
-                const lastNo = localStorage.getItem('miss_last_no_v90');
-                if (lastNo && lastNo !== currentNo) {
-                    let miss3 = parseInt(localStorage.getItem('miss_3s_v90') || '0');
-                    let miss6 = parseInt(localStorage.getItem('miss_6s_v90') || '0');
-                    const hit3s = parseInt(document.getElementById('count-3s-3').innerText);
-                    const hit6s = parseInt(document.getElementById('count-6s-6').innerText);
-                    miss3 = hit3s === 0 ? miss3 + 1 : 0; miss6 = hit6s === 0 ? miss6 + 1 : 0;
-                    localStorage.setItem('miss_3s_v90', miss3); localStorage.setItem('miss_6s_v90', miss6);
-                }
-                localStorage.setItem('miss_last_no_v90', currentNo);
-                document.getElementById('miss-3s-disp').innerText = localStorage.getItem('miss_3s_v90') || 0;
-                document.getElementById('miss-6s-disp').innerText = localStorage.getItem('miss_6s_v90') || 0;
-            }
-
-            function quickFill(type, id, numbers) {
-                numbers.forEach((n, j) => document.getElementById(`${type}-g${id}n${j+1}`).value = n.toString().padStart(2, '0'));
-                saveAndCompare();
             }
 
             function executeComparison() {
@@ -364,10 +327,12 @@ async def index(request: Request, date: str = None):
                 document.querySelectorAll('.dist-ball').forEach(el => el.classList.remove('active-3s', 'active-6s'));
                 let stats = { s3_2: 0, s3_3: 0, s6_3: 0, s6_4: 0, s6_5: 0, s6_6: 0 };
                 let used3s = new Set(); let used6s = new Set();
+
                 for(let i=1; i<=10; i++) {
                     const sq3 = [1,2,3].map(j => Number(document.getElementById(`3s-g${i}n${j}`).value)).filter(n => n > 0);
                     let h3 = 0; sq3.forEach(n => { if(winNums.includes(n)) { h3++; document.querySelector(`.ball-3s[data-val="${n}"]`)?.classList.add(`hit-g${i}`); } used3s.add(n); });
                     if(h3 === 2) stats.s3_2++; else if(h3 === 3 && sq3.length === 3) stats.s3_3++;
+                    
                     const sq6 = [1,2,3,4,5,6].map(j => Number(document.getElementById(`6s-g${i}n${j}`).value)).filter(n => n > 0);
                     let h6 = 0; sq6.forEach(n => { if(winNums.includes(n)) { h6++; document.querySelector(`.ball-6s[data-val="${n}"]`)?.classList.add(`hit-g${i}`); } used6s.add(n); });
                     if(h6 === 3) stats.s6_3++; else if(h6 === 4) stats.s6_4++; else if(h6 === 5) stats.s6_5++; else if(h6 === 6 && sq6.length === 6) stats.s6_6++;
@@ -377,19 +342,77 @@ async def index(request: Request, date: str = None):
                 document.getElementById('count-3s-2').innerText = stats.s3_2; document.getElementById('count-3s-3').innerText = stats.s3_3;
                 document.getElementById('count-6s-3').innerText = stats.s6_3; document.getElementById('count-6s-4').innerText = stats.s6_4;
                 document.getElementById('count-6s-5').innerText = stats.s6_5; document.getElementById('count-6s-6').innerText = stats.s6_6;
+                
+                if(stats.s3_3 > 0) document.getElementById('alert-3s-all').classList.add('alert-gold'); else document.getElementById('alert-3s-all').classList.remove('alert-gold');
+                if(stats.s6_6 > 0) document.getElementById('alert-6s-all').classList.add('alert-gold'); else document.getElementById('alert-6s-all').classList.remove('alert-gold');
             }
-            window.onload = loadMatrix;
+
+            // --- 🕰️ 修正後的計數器邏輯 ---
+            function handleMissCounter() {
+                const lastNo = localStorage.getItem('miss_last_no_v92');
+                if (lastNo && lastNo !== currentNo) {
+                    // 1. 讀取目前的未中數
+                    let m3 = parseInt(localStorage.getItem('miss_3s_v92') || '0');
+                    let m6 = parseInt(localStorage.getItem('miss_6s_v92') || '0');
+                    
+                    // 2. 獲取命中狀態
+                    const hit3s = parseInt(document.getElementById('count-3s-3').innerText);
+                    const hit6s = parseInt(document.getElementById('count-6s-6').innerText);
+                    
+                    // 3. 檢查矩陣是否非空 (防止空機計數)
+                    let has3sData = false; for(let i=1;i<=10;i++) if(document.getElementById(`3s-g${i}n1`).value) has3sData = true;
+                    let has6sData = false; for(let i=1;i<=10;i++) if(document.getElementById(`6s-g${i}n1`).value) has6sData = true;
+
+                    if (has3sData) { if(hit3s === 0) m3++; else m3 = 0; }
+                    if (has6sData) { if(hit6s === 0) m6++; else m6 = 0; }
+
+                    localStorage.setItem('miss_3s_v92', m3);
+                    localStorage.setItem('miss_6s_v92', m6);
+                }
+                localStorage.setItem('miss_last_no_v92', currentNo);
+                document.getElementById('miss-3s-disp').innerText = localStorage.getItem('miss_3s_v92') || 0;
+                document.getElementById('miss-6s-disp').innerText = localStorage.getItem('miss_6s_v92') || 0;
+            }
+
+            function resetMissCounters() {
+                localStorage.setItem('miss_3s_v92', '0'); localStorage.setItem('miss_6s_v92', '0');
+                document.getElementById('miss-3s-disp').innerText = "0";
+                document.getElementById('miss-6s-disp').innerText = "0";
+            }
+
+            function init() {
+                const saved = localStorage.getItem('bingo_v92_matrix');
+                if(saved) {
+                    const d = JSON.parse(saved);
+                    for(let i=1; i<=10; i++) {
+                        if(d.s3[i]) d.s3[i].forEach((v, j) => document.getElementById(`3s-g${i}n${j+1}`).value = v);
+                        if(d.s6[i]) d.s6[i].forEach((v, j) => document.getElementById(`6s-g${i}n${j+1}`).value = v);
+                    }
+                }
+                const savedP = localStorage.getItem('bingo_profit_v92');
+                if(savedP) {
+                    const d = JSON.parse(savedP);
+                    document.getElementById('in-sets').value = d.sets || "";
+                    ['3h2', '3h3', '6h3', '6h4', '6h5', '6h6'].forEach(k => { const el = document.getElementById('in-'+k); if(el) el.value = d['s'+k]||""; });
+                    calculateProfit();
+                }
+                executeComparison();
+                handleMissCounter(); // 在所有數據讀取完畢後執行計數
+            }
+            window.onload = init;
         </script>
     </body>
     </html>
     """
     from jinja2 import Template
     template = Template(html_content)
-    return template.render(res_3star=res_3star, res_6star=res_6star, p_day=p_day, s_day=s_day, p_20=p_20, s_20=s_20, status=status, latest_win=latest_win, latest_no=latest_no, active_date=active_date)
-    
+    return template.render(res_3star=res_3star, res_6star=res_6star, p_day=p_day, s_day=s_day, p_20=p_20, s_20=s_20, status=status, latest_win=latest_win, latest_no=latest_no, active_date=active_date, exclusive=exclusive)
+
+
 if __name__ == "__main__":
     # 提醒：若要部屬到 Render，host 需設為 "0.0.0.0"
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
