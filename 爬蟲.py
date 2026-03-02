@@ -9,7 +9,7 @@ import json
 
 app = FastAPI()
 
-# --- 1. 核心量化分析邏輯 (V10.5：手動刷新穩定版) ---
+# --- 1. 核心量化分析邏輯 (V10.6：三四星獨立排他) ---
 
 def get_data_and_analyze(target_date=None, mode_exclusive=True):
     now = datetime.datetime.now()
@@ -75,13 +75,13 @@ def get_data_and_analyze(target_date=None, mode_exclusive=True):
 
     def get_synergy(n1, n2): return co_occ.get(tuple(sorted((n1, n2))), 0)
 
-    def generate_squads_smart(pool, size, count, exclusive, used_nos_ref):
+    def generate_squads_smart(pool, size, count, exclusive, category_used_nos):
         squads = []
         fingerprints = []
         sorted_seeds = sorted(pool, key=lambda x: x['score'], reverse=True)[:count]
         for i, seed in enumerate(sorted_seeds):
             seed_no = seed['no']
-            avoid = used_nos_ref if exclusive else {seed_no}
+            avoid = category_used_nos if exclusive else {seed_no}
             all_partners = sorted([p for p in pool if p['no'] not in avoid and p['no'] != seed_no], 
                                   key=lambda x: (get_synergy(seed_no, x['no']), x['score']), reverse=True)
             p_idx = size - 1
@@ -91,13 +91,15 @@ def get_data_and_analyze(target_date=None, mode_exclusive=True):
                 p_idx += 1
             fingerprints.append(cur_squad)
             if exclusive:
-                for n in cur_squad: used_nos_ref.add(n)
+                for n in cur_squad: category_used_nos.add(n)
             squads.append({"id": i+1, "picks": cur_squad})
         return squads
 
-    global_used = set()
-    res_3star = generate_squads_smart(all_analysis, 3, 10, mode_exclusive, global_used)
-    res_4star = generate_squads_smart(all_analysis, 4, 10, mode_exclusive, global_used)
+    # --- 💡 關鍵優化：三星與四星各自擁有獨立的佔用池 ---
+    used_3s = set()
+    used_4s = set()
+    res_3star = generate_squads_smart(all_analysis, 3, 10, mode_exclusive, used_3s)
+    res_4star = generate_squads_smart(all_analysis, 4, 10, mode_exclusive, used_4s)
 
     today_draws = [[int(x) for x in item.get('BigShowOrder','').split(',') if x.strip().isdigit()] for item in data_today if item.get('BigShowOrder','')]
     today_balls = [n for d in today_draws if len(d)==20 for n in d]
@@ -106,7 +108,7 @@ def get_data_and_analyze(target_date=None, mode_exclusive=True):
 
     return (res_3star, res_4star, p_day, s_day, f"{o_20}:{e_20}", f"{s_20}:{b_20}", status, latest_win_nums, latest_no, latest_time, target_date, recent_history)
 
-# --- 2. 網頁前端 (全中文化 UI) ---
+# --- 2. 網頁前端 (保持 V10.5 規格) ---
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, date: str = None, exclusive: bool = True):
@@ -115,7 +117,7 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
     html_content = """
     <html>
     <head>
-        <title>賓狗手動版v1.0</title>
+        <title>賓狗雙軌版v1.0</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
@@ -150,7 +152,6 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
             .hit-pill-jackpot { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
             .bt-miss-normal { background: #1e293b; color: #94a3b8; }
             .bt-miss-alert { background: #be123c; color: white; animation: pulse-red 1s infinite alternate; }
-            @keyframes pulse-red { from { transform: scale(1); } to { transform: scale(1.05); } }
         </style>
     </head>
     <body class="bg-slate-50 text-slate-900 pb-20 text-[12px]">
@@ -160,32 +161,30 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
                 <div class="bg-indigo-700 text-white p-6 rounded-[2rem] shadow-xl border-2 border-indigo-400">
                     <div class="flex justify-between items-center mb-4 text-[10px] font-black uppercase">奇偶監控{% if status.odd or status.even %}<span class="bg-green-500 text-[8px] px-2 py-0.5 rounded ml-2 animate-pulse">補償機制已啟動</span>{% endif %}</div>
                     <div class="grid grid-cols-2 gap-4 border-t border-white/10 pt-4 text-center italic">
-                        <div><p class="text-[8px] opacity-60">今日全日累計</p><p class="text-lg font-black tracking-tighter">奇 {{ p_day }} 偶</p></div>
-                        <div class="border-l border-white/10"><p class="text-[8px] text-amber-300 font-bold underline underline-offset-4">最近 20 期</p><p class="text-xl font-black text-amber-300">{{ p_20 }}</p></div>
+                        <div><p class="text-[8px] opacity-60">今日累計</p><p class="text-lg font-black tracking-tighter">奇 {{ p_day }} 偶</p></div>
+                        <div class="border-l border-white/10"><p class="text-[8px] text-amber-300 font-bold underline">最近 20 期</p><p class="text-xl font-black text-amber-300">{{ p_20 }}</p></div>
                     </div>
                 </div>
                 <div class="bg-emerald-700 text-white p-6 rounded-[2rem] shadow-xl border-2 border-emerald-400">
                     <div class="flex justify-between items-center mb-4 text-[10px] font-black uppercase">大小監控{% if status.small or status.big %}<span class="bg-green-500 text-[8px] px-2 py-0.5 rounded ml-2 animate-pulse">補償機制已啟動</span>{% endif %}</div>
                     <div class="grid grid-cols-2 gap-4 border-t border-white/10 pt-4 text-center italic">
-                        <div><p class="text-[8px] opacity-60">今日全日累計</p><p class="text-lg font-black tracking-tighter">小 {{ s_day }} 大</p></div>
-                        <div class="border-l border-white/10"><p class="text-[8px] text-amber-300 font-bold underline underline-offset-4">最近 20 期</p><p class="text-xl font-black text-amber-300">{{ s_20 }}</p></div>
+                        <div><p class="text-[8px] opacity-60">今日累計</p><p class="text-lg font-black tracking-tighter">小 {{ s_day }} 大</p></div>
+                        <div class="border-l border-white/10"><p class="text-[8px] text-amber-300 font-bold underline">最近 20 期</p><p class="text-xl font-black text-amber-300">{{ s_20 }}</p></div>
                     </div>
                 </div>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-10">
                 <div class="lg:col-span-3 bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
-                    <div class="flex justify-between items-center mb-6 border-b pb-4 italic text-slate-400">
-                        <div class="flex items-center gap-3">
-                            <h3 class="text-xs font-black uppercase tracking-widest">📢 最新開獎: <span class="text-indigo-600 font-mono tracking-normal">{{ latest_no }} <span class="text-slate-400">({{ latest_time }})</span></span></h3>
-                        </div>
+                    <div class="flex justify-between items-center mb-6 border-b pb-4 text-slate-400 italic">
+                        <h3 class="text-xs font-black uppercase tracking-widest">📢 最新開獎: <span class="text-indigo-600 font-mono">{{ latest_no }} ({{ latest_time }})</span></h3>
                         <button onclick="location.reload()" class="bg-indigo-500 text-white px-4 py-1.5 rounded-xl text-[10px] font-black shadow-lg active:scale-95 transition-transform">立即刷新數據</button>
                     </div>
                     <div class="space-y-6 text-center">
-                        <div><p class="text-[9px] font-black text-amber-500 mb-2 uppercase tracking-widest underline underline-offset-4">三星策略即時追蹤</p>
+                        <div><p class="text-[9px] font-black text-amber-500 mb-2 uppercase tracking-widest underline underline-offset-4">三星策略追蹤</p>
                             <div class="flex flex-wrap gap-2 justify-center">{% for n in latest_win %}<div class="latest-ball ball-3s" data-val="{{ n }}">{{ "%02d" | format(n) }}</div>{% endfor %}</div>
                         </div>
-                        <div><p class="text-[9px] font-black text-indigo-500 mb-2 uppercase tracking-widest underline underline-offset-4">四星策略即時追蹤</p>
+                        <div><p class="text-[9px] font-black text-indigo-500 mb-2 uppercase tracking-widest underline underline-offset-4">四星策略追蹤</p>
                             <div class="flex flex-wrap gap-2 justify-center">{% for n in latest_win %}<div class="latest-ball ball-4s" data-val="{{ n }}">{{ "%02d" | format(n) }}</div>{% endfor %}</div>
                         </div>
                     </div>
@@ -194,18 +193,18 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
                     <h4 class="text-center text-[9px] font-black text-indigo-400 uppercase tracking-widest mb-4 italic">戰報分析中心</h4>
                     <div class="space-y-4">
                         <div class="bg-slate-800/50 p-3 rounded-2xl border border-slate-700">
-                            <p class="text-[7px] font-black text-amber-500 mb-2 uppercase tracking-widest">三星統計</p>
+                            <p class="text-[7px] font-black text-amber-500 mb-2 uppercase">三星統計</p>
                             <div class="grid grid-cols-2 gap-2">
                                 <div class="stat-card"><p class="text-[6px] text-slate-400 uppercase">中 2</p><p class="text-lg font-black" id="count-3s-2">0</p></div>
-                                <div class="stat-card" id="alert-3s-all"><p class="text-[6px] text-slate-400 uppercase">全中 (3)</p><p class="text-lg font-black text-amber-400" id="count-3s-3">0</p></div>
+                                <div class="stat-card" id="alert-3s-all"><p class="text-[6px] text-slate-400 uppercase">全中</p><p class="text-lg font-black text-amber-400" id="count-3s-3">0</p></div>
                             </div>
                         </div>
                         <div class="bg-slate-800/50 p-3 rounded-2xl border border-slate-700">
-                            <p class="text-[7px] font-black text-indigo-400 mb-2 uppercase tracking-widest">四星統計</p>
+                            <p class="text-[7px] font-black text-indigo-400 mb-2 uppercase">四星統計</p>
                             <div class="grid grid-cols-3 gap-1">
-                                <div class="stat-card"><p class="text-[6px] text-slate-400 uppercase">中 2</p><p class="text-md font-black" id="count-4s-2">0</p></div>
-                                <div class="stat-card"><p class="text-[6px] text-slate-400 uppercase">中 3</p><p class="text-md font-black" id="count-4s-3">0</p></div>
-                                <div class="stat-card" id="alert-4s-all"><p class="text-[6px] text-slate-400 uppercase">全中 (4)</p><p class="text-md font-black text-amber-400" id="count-4s-4">0</p></div>
+                                <div class="stat-card"><p class="text-[6px] text-slate-400">中 2</p><p class="text-md font-black" id="count-4s-2">0</p></div>
+                                <div class="stat-card"><p class="text-[6px] text-slate-400">中 3</p><p class="text-md font-black" id="count-4s-3">0</p></div>
+                                <div class="stat-card" id="alert-4s-all"><p class="text-[6px] text-slate-400">全中</p><p class="text-md font-black text-amber-400" id="count-4s-4">0</p></div>
                             </div>
                         </div>
                     </div>
@@ -213,92 +212,84 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
             </div>
 
             <div class="bg-emerald-900/90 p-8 rounded-[3rem] shadow-2xl text-white mb-10 border-4 border-emerald-800">
-                <div class="flex justify-between items-center mb-8 border-b border-emerald-700 pb-4">
-                    <div class="flex items-center gap-3"><div class="w-2 h-6 bg-emerald-400 rounded-full"></div><h3 class="text-[11px] font-black uppercase tracking-[0.3em] italic">今日實戰總計</h3></div>
+                <div class="flex justify-between items-center mb-8 border-b border-emerald-700 pb-4 italic">
+                    <div class="flex items-center gap-3"><div class="w-2 h-6 bg-emerald-400 rounded-full"></div><h3 class="text-[11px] font-black uppercase tracking-[0.3em]">今日實戰總計</h3></div>
                     <button onclick="resetDailyJournal()" class="text-[8px] bg-red-900/50 px-3 py-1 rounded-full font-black uppercase">清空日誌</button>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6 text-center">
-                    <div class="bg-black/10 p-5 rounded-3xl border border-white/5"><p class="text-[9px] text-emerald-300 uppercase font-black mb-1">今日總成本</p><p class="text-2xl font-mono font-black" id="day-total-cost">$ 0</p></div>
-                    <div class="bg-black/10 p-5 rounded-3xl border border-white/5"><p class="text-[9px] text-emerald-300 uppercase font-black mb-1">今日總獎金</p><p class="text-2xl font-mono font-black" id="day-total-prize">$ 0</p></div>
+                    <div class="bg-black/10 p-5 rounded-3xl border border-white/5"><p class="text-[9px] text-emerald-300 uppercase font-black mb-1">今日成本</p><p class="text-2xl font-mono font-black" id="day-total-cost">$ 0</p></div>
+                    <div class="bg-black/10 p-5 rounded-3xl border border-white/5"><p class="text-[9px] text-emerald-300 uppercase font-black mb-1">今日獎金</p><p class="text-2xl font-mono font-black" id="day-total-prize">$ 0</p></div>
                     <div class="bg-emerald-500 text-emerald-950 p-5 rounded-3xl shadow-lg border-2 border-emerald-400"><p class="text-[9px] uppercase font-black mb-1 italic">今日總純利</p><p class="text-3xl font-mono font-black" id="day-net-profit">$ 0</p></div>
                 </div>
             </div>
 
-            <div class="bg-white p-8 rounded-[3.5rem] shadow-xl border border-slate-200 mb-10">
+            <div class="bg-white p-8 rounded-[3.5rem] shadow-xl border border-slate-200 mb-10 text-[10px]">
                 <div class="flex justify-between items-center mb-6">
                     <div class="flex items-center gap-2"><span class="text-lg">💰</span><h3 class="text-sm font-black text-slate-800 italic uppercase">本場場次規劃</h3></div>
-                    <button onclick="postToDailyJournal()" class="bg-emerald-600 text-white px-6 py-2 rounded-2xl text-[10px] font-black shadow-lg uppercase transition-all active:scale-95">存入日誌系統</button>
+                    <button onclick="postToDailyJournal()" class="bg-emerald-600 text-white px-6 py-2 rounded-2xl text-[10px] font-black shadow-lg uppercase transition-all">存入日誌</button>
                 </div>
-                <div class="grid grid-cols-3 gap-4 mb-8 text-center text-[10px]">
-                    <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100"><p class="text-slate-400 font-black mb-1 uppercase">本場成本</p><p class="text-xl font-black text-rose-500" id="display-total-cost">-$ 0</p></div>
-                    <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100"><p class="text-slate-400 font-black mb-1 uppercase">本場獎金</p><p class="text-xl font-black text-indigo-600" id="display-total-prize">+$ 0</p></div>
-                    <div class="bg-indigo-50 p-4 rounded-2xl border-2 border-indigo-100 shadow-inner"><p class="text-indigo-600 font-black mb-1 italic uppercase">本場純利</p><p class="text-xl font-black text-indigo-700" id="display-net-profit">$ 0</p></div>
+                <div class="grid grid-cols-3 gap-4 mb-8 text-center">
+                    <div class="bg-slate-50 p-4 rounded-2xl"><p class="text-slate-400 font-black mb-1">成本</p><p class="text-xl font-black text-rose-500" id="display-total-cost">-$ 0</p></div>
+                    <div class="bg-slate-50 p-4 rounded-2xl"><p class="text-slate-400 font-black mb-1">獎金</p><p class="text-xl font-black text-indigo-600" id="display-total-prize">+$ 0</p></div>
+                    <div class="bg-indigo-50 p-4 rounded-2xl border-2 border-indigo-100 shadow-inner"><p class="text-indigo-600 font-black mb-1 italic">純利</p><p class="text-xl font-black text-indigo-700" id="display-net-profit">$ 0</p></div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
                     <div class="space-y-3 border-r pr-6">
-                        <div><label class="text-[8px] font-black text-slate-400 uppercase">單注倍數</label><input type="number" id="in-multiplier" class="profit-input" value="1" oninput="calculateProfit()"></div>
-                        <div><label class="text-[8px] font-black text-slate-400 uppercase">追號期數</label><input type="number" id="in-periods" class="profit-input" value="1" oninput="calculateProfit()"></div>
-                        <div><label class="text-[8px] font-black text-slate-400 uppercase">購買組數</label><input type="number" id="in-sets" class="profit-input" value="10" oninput="calculateProfit()"></div>
+                        <div><label class="font-black text-slate-400">單注倍數</label><input type="number" id="in-multiplier" class="profit-input" value="1" oninput="calculateProfit()"></div>
+                        <div><label class="font-black text-slate-400">追號期數</label><input type="number" id="in-periods" class="profit-input" value="1" oninput="calculateProfit()"></div>
+                        <div><label class="font-black text-slate-400">購買組數</label><input type="number" id="in-sets" class="profit-input" value="10" oninput="calculateProfit()"></div>
                     </div>
                     <div class="space-y-4 px-2 text-center">
-                        <p class="text-[9px] font-black text-amber-500 uppercase italic border-b">三星中獎次數</p>
+                        <p class="font-black text-amber-500 uppercase italic border-b">三星中獎紀錄</p>
                         <div class="grid grid-cols-2 gap-2 mt-2">
-                            <div><label class="text-[8px] text-slate-400">三中二</label><input type="number" id="in-3h2" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
-                            <div><label class="text-[8px] text-slate-400">三中三</label><input type="number" id="in-3h3" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
+                            <div><label class="text-slate-400">三中二</label><input type="number" id="in-3h2" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
+                            <div><label class="text-slate-400">三中三</label><input type="number" id="in-3h3" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
                         </div>
                     </div>
                     <div class="md:col-span-2 space-y-4 px-2 text-center">
-                        <p class="text-[9px] font-black text-indigo-500 uppercase italic border-b">四星中獎次數</p>
+                        <p class="font-black text-indigo-500 uppercase italic border-b">四星中獎紀錄</p>
                         <div class="grid grid-cols-3 gap-2 mt-2">
-                            <div><label class="text-[8px] text-slate-400">四中二</label><input type="number" id="in-4h2" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
-                            <div><label class="text-[8px] text-slate-400">四中三</label><input type="number" id="in-4h3" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
-                            <div><label class="text-[8px] text-slate-400">四中四</label><input type="number" id="in-4h4" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
+                            <div><label class="text-slate-400">四中二</label><input type="number" id="in-4h2" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
+                            <div><label class="text-slate-400">四中三</label><input type="number" id="in-4h3" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
+                            <div><label class="text-slate-400">四中四</label><input type="number" id="in-4h4" class="profit-input" placeholder="0" oninput="calculateProfit()"></div>
                         </div>
                     </div>
                 </div>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-10 text-center">
-                <div class="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100"><h3 class="text-[10px] font-black text-amber-600 uppercase mb-4 italic tracking-widest">📡 三星號碼佈陣分佈圖</h3><div class="dist-grid">{% for i in range(1, 81) %}<div class="dist-ball" id="dist3s-{{i}}">{{ "%02d" | format(i) }}</div>{% endfor %}</div></div>
-                <div class="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100"><h3 class="text-[10px] font-black text-indigo-600 uppercase mb-4 italic tracking-widest">📡 四星號碼佈陣分佈圖</h3><div class="dist-grid">{% for i in range(1, 81) %}<div class="dist-ball" id="dist4s-{{i}}">{{ "%02d" | format(i) }}</div>{% endfor %}</div></div>
+                <div class="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100"><h3 class="text-[10px] font-black text-amber-600 uppercase mb-4 italic">📡 三星號碼分佈圖 (獨立排他)</h3><div class="dist-grid">{% for i in range(1, 81) %}<div class="dist-ball" id="dist3s-{{i}}">{{ "%02d" | format(i) }}</div>{% endfor %}</div></div>
+                <div class="bg-white p-6 rounded-[2.5rem] shadow-sm border border-slate-100"><h3 class="text-[10px] font-black text-indigo-600 uppercase mb-4 italic">📡 四星號碼分佈圖 (獨立排他)</h3><div class="dist-grid">{% for i in range(1, 81) %}<div class="dist-ball" id="dist4s-{{i}}">{{ "%02d" | format(i) }}</div>{% endfor %}</div></div>
             </div>
 
             <div class="space-y-8 mb-10">
                 <div class="bg-slate-900 p-8 rounded-[3.5rem] shadow-2xl border-4 border-slate-800">
-                    <div class="flex justify-between items-center mb-6 px-2 text-amber-400 uppercase italic font-black"><h3 class="text-[10px] tracking-widest">三星對獎矩陣</h3><div class="flex gap-2"><button onclick="loadAll('3s')" class="bg-green-700 text-white px-4 py-1 rounded-md text-[8px] uppercase">一鍵裝載</button><button onclick="clearMatrix('3s')" class="bg-red-900 text-white px-4 py-1 rounded-md text-[8px] uppercase">清除</button></div></div>
-                    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">{% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-slate-500 italic uppercase">組合 {{ i }}</p><div class="flex gap-1">{% for j in range(1, 4) %}<input type="text" id="3s-g{{i}}n{{j}}" class="w-full h-8 text-center text-sm font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}</div>
+                    <div class="flex justify-between items-center mb-6 px-2 text-amber-400 font-black italic"><h3 class="text-[10px]">三星矩陣 (Top 1-10 隊長)</h3><div class="flex gap-2"><button onclick="loadAll('3s')" class="bg-green-700 text-white px-4 py-1 rounded-md text-[8px] uppercase">裝載</button><button onclick="clearMatrix('3s')" class="bg-red-900 text-white px-4 py-1 rounded-md text-[8px] uppercase">清除</button></div></div>
+                    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">{% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-slate-500 uppercase">組合 {{ i }}</p><div class="flex gap-1">{% for j in range(1, 4) %}<input type="text" id="3s-g{{i}}n{{j}}" class="w-full h-8 text-center text-sm font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}</div>
                 </div>
                 <div class="bg-slate-900 p-8 rounded-[3.5rem] shadow-2xl border-4 border-slate-800">
-                    <div class="flex justify-between items-center mb-6 px-2 text-indigo-400 uppercase italic font-black"><h3 class="text-[10px] tracking-widest">四星對獎矩陣</h3><div class="flex gap-2"><button onclick="loadAll('4s')" class="bg-indigo-700 text-white px-4 py-1 rounded-md text-[8px] uppercase">一鍵裝載</button><button onclick="clearMatrix('4s')" class="bg-red-900 text-white px-4 py-1 rounded-md text-[8px] uppercase">清除</button></div></div>
-                    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">{% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-indigo-300 italic uppercase">小隊 {{ i }}</p><div class="flex gap-1">{% for j in range(1, 5) %}<input type="text" id="4s-g{{i}}n{{j}}" class="w-full h-8 text-center text-xs font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}</div>
+                    <div class="flex justify-between items-center mb-6 px-2 text-indigo-400 font-black italic"><h3 class="text-[10px]">四星矩陣 (Top 1-10 隊長)</h3><div class="flex gap-2"><button onclick="loadAll('4s')" class="bg-indigo-700 text-white px-4 py-1 rounded-md text-[8px] uppercase">裝載</button><button onclick="clearMatrix('4s')" class="bg-red-900 text-white px-4 py-1 rounded-md text-[8px] uppercase">清除</button></div></div>
+                    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">{% for i in range(1, 11) %}<div class="bg-slate-800/50 p-2 rounded-xl border border-slate-700 text-center"><p class="text-[7px] text-indigo-300 uppercase">小隊 {{ i }}</p><div class="flex gap-1">{% for j in range(1, 5) %}<input type="text" id="4s-g{{i}}n{{j}}" class="w-full h-8 text-center text-xs font-black bg-slate-900 rounded border border-slate-600 text-white" oninput="saveAndCompare()">{% endfor %}</div></div>{% endfor %}</div>
                 </div>
             </div>
 
-            <div class="mb-20">
-                <div class="flex justify-between items-center mb-6 px-2 border-b pb-4"><h2 class="text-sm font-black text-slate-800 uppercase italic border-l-4 border-indigo-500 pl-3">🚀 智慧量化建議方案 (V10.5)</h2><div class="flex items-center gap-2"><span class="text-[9px] font-black text-slate-500 uppercase">高覆蓋率模式</span><label class="switch"><input type="checkbox" id="exclusive-toggle" {% if exclusive %}checked{% endif %} onchange="toggleExclusive()"><span class="slider"></span></label></div></div>
+            <div class="mb-20 text-[10px]">
+                <div class="flex justify-between items-center mb-6 px-2 border-b pb-4 italic font-black"><h2 class="text-sm text-slate-800 border-l-4 border-indigo-500 pl-3 uppercase">🚀 智慧量化方案 (V10.6 雙軌獨立)</h2><div class="flex items-center gap-2"><span class="text-slate-500 uppercase">高覆蓋率模式</span><label class="switch"><input type="checkbox" id="exclusive-toggle" {% if exclusive %}checked{% endif %} onchange="toggleExclusive()"><span class="slider"></span></label></div></div>
                 <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-10">
-                    {% for sq in res_3star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center text-[9px] font-black uppercase">組別 {{ sq.id }} (3S)<div class="flex justify-center gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white px-1.5 rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("3s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-amber-50 text-amber-600 py-1 rounded italic font-black uppercase">裝載</button></div>{% endfor %}
-                    {% for sq in res_4star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center text-[9px] font-black uppercase text-indigo-400">小隊 {{ sq.id }} (4S)<div class="flex justify-center gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white px-1 rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("4s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-indigo-50 text-indigo-600 py-1 rounded italic font-black uppercase">裝載</button></div>{% endfor %}
+                    {% for sq in res_3star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center font-black uppercase">組別 {{ sq.id }} (3S)<div class="flex justify-center gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white px-1.5 rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("3s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-amber-50 text-amber-600 py-1 rounded italic">裝載</button></div>{% endfor %}
+                    {% for sq in res_4star %}<div class="bg-white p-3 rounded-2xl shadow-sm border border-slate-100 text-center font-black uppercase text-indigo-400">小隊 {{ sq.id }} (4S)<div class="flex justify-center gap-1 my-2">{% for n in sq.picks %}<span class="bg-slate-900 text-white px-1 rounded">{{ "%02d" | format(n) }}</span>{% endfor %}</div><button onclick='quickFill("4s", {{ sq.id }}, {{ sq.picks | tojson }})' class="w-full bg-indigo-50 text-indigo-600 py-1 rounded italic">裝載</button></div>{% endfor %}
                 </div>
 
                 <div class="bg-white p-8 rounded-[3.5rem] shadow-xl border border-slate-200">
-                    <div class="flex justify-between items-center mb-6 border-b pb-4">
-                        <h3 class="text-sm font-black text-slate-800 uppercase italic tracking-widest">🕰️ 歷史回測戰果</h3>
-                        <div class="flex gap-4">
-                            <div id="bt-box-3s" class="bt-miss-normal px-4 py-1.5 rounded-xl text-[9px] font-black uppercase">三星連黑: <span id="bt-count-3s">0</span></div>
-                            <div id="bt-box-4s" class="bt-miss-normal px-4 py-1.5 rounded-xl text-[9px] font-black uppercase">四星連黑: <span id="bt-count-4s">0</span></div>
-                        </div>
-                    </div>
-                    <div class="overflow-hidden rounded-3xl border border-slate-100"><table class="w-full text-left text-[10px]"><thead class="bg-slate-900 text-white text-[9px] uppercase font-black tracking-widest"><tr><th class="p-4">開獎期數</th><th class="p-4">號碼分析</th><th class="p-4 text-right">命中與獎金</th></tr></thead><tbody id="backtest-body" class="font-mono italic"></tbody></table></div>
+                    <div class="flex justify-between items-center mb-6 border-b pb-4 font-black uppercase tracking-widest italic"><h3 class="text-sm text-slate-800">🕰️ 歷史回測戰果</h3><div class="flex gap-4"><div id="bt-box-3s" class="bt-miss-normal px-4 py-1.5 rounded-xl text-[9px]">三星連黑: <span id="bt-count-3s">0</span></div><div id="bt-box-4s" class="bt-miss-normal px-4 py-1.5 rounded-xl text-[9px]">四星連黑: <span id="bt-count-4s">0</span></div></div></div>
+                    <div class="overflow-hidden rounded-3xl border border-slate-100"><table class="w-full text-left text-[10px]"><thead class="bg-slate-900 text-white text-[9px] uppercase font-black tracking-widest"><tr><th class="p-4">開獎期數</th><th class="p-4">號碼分析</th><th class="p-4 text-right">命中與理論獎金</th></tr></thead><tbody id="backtest-body" class="font-mono italic"></tbody></table></div>
                 </div>
             </div>
         </div>
 
         <script>
-            const server3S = {{ res_3star | tojson }};
-            const server4S = {{ res_4star | tojson }};
-            const recentHistory = {{ recent_history | tojson }};
-            const winNums = {{ latest_win | tojson }};
+            const server3S = {{ res_3star | tojson }}; const server4S = {{ res_4star | tojson }};
+            const recentHistory = {{ recent_history | tojson }}; const winNums = {{ latest_win | tojson }};
 
             function runBacktest() {
                 const multi = parseInt(document.getElementById('in-multiplier').value) || 1;
@@ -316,13 +307,10 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
                     m4S.forEach(sq => { const h = sq.filter(n => draw.nums.includes(n)).length; if(h===2){ hS.s4h2++; pPrize+=25; } else if(h===3){ hS.s4h3++; pPrize+=150; } else if(h===4){ hS.s4h4++; pPrize+=2000; hasJack4=true; } });
                     if(!f3) { if(!hasJack3) m3++; else f3 = true; }
                     if(!f4) { if(!hasJack4) m4++; else f4 = true; }
-                    if(hS.s3h2 > 0) details.push(`<span class="hit-pill">3中2 x${hS.s3h2}</span>`);
-                    if(hS.s3h3 > 0) details.push(`<span class="hit-pill hit-pill-jackpot">3中3 x${hS.s3h3}</span>`);
-                    if(hS.s4h2 > 0) details.push(`<span class="hit-pill">4中2 x${hS.s4h2}</span>`);
-                    if(hS.s4h3 > 0) details.push(`<span class="hit-pill">4中3 x${hS.s4h3}</span>`);
-                    if(hS.s4h4 > 0) details.push(`<span class="hit-pill hit-pill-jackpot">4中4 x${hS.s4h4}</span>`);
+                    if(hS.s3h2 > 0) details.push(`<span class="hit-pill">3中2 x${hS.s3h2}</span>`); if(hS.s3h3 > 0) details.push(`<span class="hit-pill hit-pill-jackpot">3中3 x${hS.s3h3}</span>`);
+                    if(hS.s4h2 > 0) details.push(`<span class="hit-pill">4中2 x${hS.s4h2}</span>`); if(hS.s4h3 > 0) details.push(`<span class="hit-pill">4中3 x${hS.s4h3}</span>`); if(hS.s4h4 > 0) details.push(`<span class="hit-pill hit-pill-jackpot">4中4 x${hS.s4h4}</span>`);
                     const finalP = pPrize * multi;
-                    html += `<tr class="border-b border-slate-50"><td class="p-4 font-black text-indigo-600">${draw.no} <span class="text-slate-300 font-normal">(${draw.time})</span></td><td class="p-4"><div class="flex flex-wrap gap-1">`;
+                    html += `<tr class="border-b border-slate-50"><td class="p-4 font-black text-indigo-600">${draw.no} (${draw.time})</td><td class="p-4"><div class="flex flex-wrap gap-1">`;
                     draw.nums.forEach(n => { const hit = m3S.some(s => s.includes(n)) || m4S.some(s => s.includes(n)); html += `<span class="w-6 h-6 flex items-center justify-center rounded-full text-[8px] ${hit ? 'ball-hit' : 'bg-slate-100 text-slate-400'}">${n.toString().padStart(2,'0')}</span>`; });
                     html += `</div></td><td class="p-4 text-right"><div class="flex flex-wrap justify-end gap-1 mb-1">${details.join('')}</div><p class="font-black text-xs ${finalP>0?'text-indigo-600':'text-slate-200'}">$ ${finalP.toLocaleString()}</p></td></tr>`;
                 });
@@ -344,20 +332,20 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
                 const nd = document.getElementById('display-net-profit'); nd.innerText = (net>=0?"+$ ": "-$ ")+Math.abs(net).toLocaleString();
                 nd.className = net>=0?"text-xl font-black text-indigo-700":"text-xl font-black text-rose-500";
                 const pData = { multi, periods, sets, s3h2: document.getElementById('in-3h2').value, s3h3: document.getElementById('in-3h3').value, s4h2: document.getElementById('in-4h2').value, s4h3: document.getElementById('in-4h3').value, s4h4: document.getElementById('in-4h4').value };
-                localStorage.setItem('bingo_profit_v105', JSON.stringify(pData)); runBacktest(); 
+                localStorage.setItem('bingo_profit_v106', JSON.stringify(pData)); runBacktest(); 
             }
 
             function postToDailyJournal() {
-                let log = JSON.parse(localStorage.getItem('bingo_journal_v105') || '{"cost":0, "prize":0}');
+                let log = JSON.parse(localStorage.getItem('bingo_journal_v106') || '{"cost":0, "prize":0}');
                 const multi = parseInt(document.getElementById('in-multiplier').value) || 1;
                 const cost = (parseInt(document.getElementById('in-sets').value) || 0) * (parseInt(document.getElementById('in-periods').value) || 1) * multi * 25;
                 const prize = ( (parseInt(document.getElementById('in-3h2').value)||0)*50 + (parseInt(document.getElementById('in-3h3').value)||0)*1000 + (parseInt(document.getElementById('in-4h2').value)||0)*25 + (parseInt(document.getElementById('in-4h3').value)||0)*150 + (parseInt(document.getElementById('in-4h4').value)||0)*2000 ) * multi;
                 log.cost += cost; log.prize += prize;
-                localStorage.setItem('bingo_journal_v105', JSON.stringify(log)); updateJournalDisplay(); alert("數據已存入今日實戰日誌！");
+                localStorage.setItem('bingo_journal_v106', JSON.stringify(log)); updateJournalDisplay(); alert("存入成功！");
             }
 
             function updateJournalDisplay() {
-                const log = JSON.parse(localStorage.getItem('bingo_journal_v105') || '{"cost":0, "prize":0}');
+                const log = JSON.parse(localStorage.getItem('bingo_journal_v106') || '{"cost":0, "prize":0}');
                 const net = log.prize - log.cost;
                 document.getElementById('day-total-cost').innerText = "$ " + log.cost.toLocaleString();
                 document.getElementById('day-total-prize').innerText = "$ " + log.prize.toLocaleString();
@@ -372,7 +360,7 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
             function saveAndCompare() {
                 const d = { s3: {}, s4: {} };
                 for(let i=1; i<=10; i++) { d.s3[i] = [1,2,3].map(j => document.getElementById(`3s-g${i}n${j}`).value); d.s4[i] = [1,2,3,4].map(j => document.getElementById(`4s-g${i}n${j}`).value); }
-                localStorage.setItem('bingo_v105_matrix', JSON.stringify(d)); executeComparison(); runBacktest();
+                localStorage.setItem('bingo_v106_matrix', JSON.stringify(d)); executeComparison(); runBacktest();
             }
             function executeComparison() {
                 document.querySelectorAll('.latest-ball').forEach(el => { for(let i=1; i<=10; i++) el.classList.remove(`hit-g${i}`); });
@@ -393,12 +381,12 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
                 if(st.s3_3 > 0) document.getElementById('alert-3s-all').classList.add('alert-gold'); else document.getElementById('alert-3s-all').classList.remove('alert-gold');
                 if(st.s4_4 > 0) document.getElementById('alert-4s-all').classList.add('alert-gold'); else document.getElementById('alert-4s-all').classList.remove('alert-gold');
             }
-            function resetDailyJournal() { if(confirm("確定要清空今日實戰總計數據嗎？")) { localStorage.setItem('bingo_journal_v105', '{"cost":0, "prize":0}'); updateJournalDisplay(); } }
+            function resetDailyJournal() { if(confirm("重置日誌？")) { localStorage.setItem('bingo_journal_v106', '{"cost":0, "prize":0}'); updateJournalDisplay(); } }
 
             function init() {
-                const s = localStorage.getItem('bingo_v105_matrix');
+                const s = localStorage.getItem('bingo_v106_matrix');
                 if(s) { const d = JSON.parse(s); for(let i=1; i<=10; i++) { if(d.s3[i]) d.s3[i].forEach((v, j) => { const el = document.getElementById(`3s-g${i}n${j+1}`); if(el) el.value = v; }); if(d.s4[i]) d.s4[i].forEach((v, j) => { const el = document.getElementById(`4s-g${i}n${j+1}`); if(el) el.value = v; }); } }
-                const sp = localStorage.getItem('bingo_profit_v105');
+                const sp = localStorage.getItem('bingo_profit_v106');
                 if(sp) { const d = JSON.parse(sp); document.getElementById('in-multiplier').value = d.multi; document.getElementById('in-periods').value = d.periods; document.getElementById('in-sets').value = d.sets; ['3h2','3h3','4h2','4h3','4h4'].forEach(k => { const el = document.getElementById('in-'+k); if(el) el.value = d['s'+k]||""; }); calculateProfit(); }
                 updateJournalDisplay(); executeComparison(); runBacktest();
             }
@@ -413,3 +401,4 @@ async def index(request: Request, date: str = None, exclusive: bool = True):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
